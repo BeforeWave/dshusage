@@ -1,0 +1,860 @@
+#!/bin/sh
+set -eu
+
+VERSION="0.1.0"
+
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+SESSIONS_DIR="${DSH_HOME}/sessions"
+MODE="today"
+TARGET_DATE=""
+TIMEZONE="${TZ:-}"
+JSON=0
+NO_COST=0
+REFRESH_PRICING=0
+PEAK_BREAKDOWN=0
+CURRENCY="CNY"
+FX_RATE=""
+LANG_MODE="zh"
+FUNNY=0
+COLOR_MODE="auto"
+NORMALIZE=0
+
+usage() {
+  cat <<'TXT'
+Usage: dshusage [options]
+
+Options:
+  --today                  Show today's usage (default)
+  --date YYYY-MM-DD        Show one calendar day
+  --all                    Show all recorded usage
+  --timezone ZONE          Date-filter timezone, e.g. Asia/Shanghai
+  --json                    JSON 输出（兼容 ccusage 的 daily/totals 结构）
+  --normalize               归一化模型：隐藏 provider，并去掉模型日期后缀
+  --no-cost                 Skip pricing/cost calculation
+  --refresh-pricing         Refresh LiteLLM pricing cache now
+  --peak-breakdown          Expand DeepSeek V4 peak/off-peak usage and cost
+  --currency native|CNY|USD 费用币种（默认: CNY）
+  --fx-rate RATE            Override USD/CNY rate (1 USD = RATE CNY)
+  --lang en|zh              输出语言（默认: zh）
+  --funny                   Funny labels; with --lang zh: peak/offpeak => 梁文峰/梁文谷
+  --color                   Force ANSI colors
+  --no-color                Disable ANSI colors
+  --version                 Show version
+  -h, --help                Show help
+
+Environment:
+  DSH_HOME                  DSH home directory (default: ~/.dsh)
+  DSHUSAGE_PRICING_FILE     Use a local LiteLLM pricing JSON instead of network/cache
+TXT
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --today) MODE="today"; shift ;;
+    --date)
+      [ "$#" -ge 2 ] || { echo "missing date" >&2; exit 2; }
+      MODE="date"; TARGET_DATE="$2"; shift 2 ;;
+    --all) MODE="all"; shift ;;
+    --timezone)
+      [ "$#" -ge 2 ] || { echo "missing timezone" >&2; exit 2; }
+      TIMEZONE="$2"; shift 2 ;;
+    --json) JSON=1; shift ;;
+    --normalize) NORMALIZE=1; shift ;;
+    --no-cost) NO_COST=1; shift ;;
+    --refresh-pricing) REFRESH_PRICING=1; shift ;;
+    --peak-breakdown) PEAK_BREAKDOWN=1; shift ;;
+    --currency)
+      [ "$#" -ge 2 ] || { echo "missing currency" >&2; exit 2; }
+      CURRENCY="$2"; shift 2 ;;
+    --fx-rate)
+      [ "$#" -ge 2 ] || { echo "missing fx rate" >&2; exit 2; }
+      FX_RATE="$2"; shift 2 ;;
+    --lang)
+      [ "$#" -ge 2 ] || { echo "missing language" >&2; exit 2; }
+      LANG_MODE="$2"; shift 2 ;;
+    --funny) FUNNY=1; shift ;;
+    --color) COLOR_MODE="always"; shift ;;
+    --no-color) COLOR_MODE="never"; shift ;;
+    --version) echo "dshusage $VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[ -d "$SESSIONS_DIR" ] || { echo "DSH sessions not found: $SESSIONS_DIR" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "node is required (Node 22+ recommended)" >&2; exit 1; }
+
+DSH_USAGE_MODE="$MODE" \
+DSH_USAGE_DATE="$TARGET_DATE" \
+DSH_USAGE_TIMEZONE="$TIMEZONE" \
+DSH_USAGE_JSON="$JSON" \
+DSH_USAGE_NO_COST="$NO_COST" \
+DSH_USAGE_REFRESH_PRICING="$REFRESH_PRICING" \
+DSH_USAGE_PEAK_BREAKDOWN="$PEAK_BREAKDOWN" \
+DSH_USAGE_CURRENCY="$CURRENCY" \
+DSH_USAGE_FX_RATE="$FX_RATE" \
+DSH_USAGE_LANG="$LANG_MODE" \
+DSH_USAGE_FUNNY="$FUNNY" \
+DSH_USAGE_COLOR="$COLOR_MODE" \
+DSH_USAGE_NORMALIZE="$NORMALIZE" \
+DSH_SESSIONS_DIR="$SESSIONS_DIR" \
+node <<'NODE'
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const zlib = require('node:zlib');
+const { execFileSync } = require('node:child_process');
+
+const root = process.env.DSH_SESSIONS_DIR;
+const mode = process.env.DSH_USAGE_MODE || 'today';
+const requestedDate = process.env.DSH_USAGE_DATE || '';
+const requestedTimezone = process.env.DSH_USAGE_TIMEZONE || '';
+const jsonOutput = process.env.DSH_USAGE_JSON === '1';
+const noCost = process.env.DSH_USAGE_NO_COST === '1';
+const refreshPricing = process.env.DSH_USAGE_REFRESH_PRICING === '1';
+const peakBreakdown = process.env.DSH_USAGE_PEAK_BREAKDOWN === '1';
+const requestedCurrencyRaw = process.env.DSH_USAGE_CURRENCY || 'CNY';
+const requestedCurrency = requestedCurrencyRaw.toLowerCase() === 'native' ? 'native' : requestedCurrencyRaw.toUpperCase();
+const requestedFxRateRaw = process.env.DSH_USAGE_FX_RATE || '';
+const language = (process.env.DSH_USAGE_LANG || 'zh').toLowerCase();
+const funny = process.env.DSH_USAGE_FUNNY === '1';
+const colorMode = process.env.DSH_USAGE_COLOR || 'auto';
+const normalizeModels = process.env.DSH_USAGE_NORMALIZE === '1';
+const pricingOverrideFile = process.env.DSHUSAGE_PRICING_FILE || '';
+
+const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
+const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'dshusage');
+const CACHE_FILE = path.join(CACHE_DIR, 'litellm-pricing.json');
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const FX_URL = 'https://api.frankfurter.app/latest?from=USD&to=CNY';
+const FX_CACHE_FILE = path.join(CACHE_DIR, 'usd-cny.json');
+
+// DeepSeek V4 dynamic pricing effective 2026-08-17 00:00 Beijing time.
+// DeepSeek official is billed in USD; Tencent TokenHub is billed in CNY.
+// Values below are per token (official tables are per 1M tokens).
+const DEEPSEEK_OFFICIAL_OFFPEAK_USD = {
+  flash: { input: 0.22e-6, cacheRead: 0.007e-6, cacheWrite: 0, output: 0.66e-6 },
+  pro:   { input: 0.66e-6, cacheRead: 0.022e-6, cacheWrite: 0, output: 1.98e-6 },
+};
+const TENCENT_TOKENHUB_OFFPEAK_CNY = {
+  flash: { input: 1.5e-6, cacheRead: 0.05e-6, cacheWrite: 0, output: 4.5e-6 },
+  pro:   { input: 4.5e-6, cacheRead: 0.15e-6, cacheWrite: 0, output: 13.5e-6 },
+};
+const DS_PEAK_TIMEZONE = 'Asia/Shanghai';
+const DS_DYNAMIC_EFFECTIVE_MS = Date.parse('2026-08-16T16:00:00Z');
+
+if (!['native', 'CNY', 'USD'].includes(requestedCurrency)) {
+  console.error(`invalid currency: ${requestedCurrencyRaw} (expected native, CNY, or USD)`);
+  process.exit(2);
+}
+if (!['en', 'zh'].includes(language)) {
+  console.error(`invalid language: ${language} (expected en or zh)`);
+  process.exit(2);
+}
+const requestedFxRate = requestedFxRateRaw === '' ? null : Number(requestedFxRateRaw);
+if (requestedFxRateRaw !== '' && (!Number.isFinite(requestedFxRate) || requestedFxRate <= 0)) {
+  console.error(`invalid fx rate: ${requestedFxRateRaw} (expected 1 USD = positive CNY rate)`);
+  process.exit(2);
+}
+
+const I18N = {
+  en: {
+    title: 'DSH token usage', noUsage: 'No usage found.',
+    model: 'MODEL', input: 'INPUT', cacheHit: 'CACHE HIT', cacheWrite: 'CACHE WRITE', output: 'OUTPUT', total: 'TOTAL', calls: 'CALLS', cost: 'COST', price: 'PRICE',
+    totalRow: 'TOTAL', allTime: 'all time', peak: 'peak', offpeak: 'offpeak', mixed: 'mixed', disabled: 'disabled', unknown: 'unknown',
+  },
+  zh: {
+    title: 'DSH Token 用量', noUsage: '没有找到用量记录。',
+    model: '模型', input: '输入', cacheHit: '缓存命中', cacheWrite: '缓存写入', output: '输出', total: '总计', calls: '调用', cost: '费用', price: '计价',
+    totalRow: '总计', allTime: '全部时间', peak: '峰值', offpeak: '谷值', mixed: '混合', disabled: '关闭', unknown: '未知',
+  },
+};
+const T = I18N[language];
+function bandLabel(band) {
+  if (language === 'zh' && funny) return band === 'peak' ? '梁文峰' : '梁文谷';
+  return band === 'peak' ? T.peak : T.offpeak;
+}
+
+function normalizeTimestamp(v) {
+  if (typeof v === 'number' && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v;
+  if (typeof v === 'string') {
+    const n = Number(v);
+    if (Number.isFinite(n) && v.trim() !== '') return n < 1e12 ? n * 1000 : n;
+    const t = Date.parse(v);
+    if (Number.isFinite(t)) return t;
+  }
+  return NaN;
+}
+
+function dateParts(ms, timeZone) {
+  const opts = { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' };
+  if (timeZone) opts.timeZone = timeZone;
+  const parts = new Intl.DateTimeFormat('en-CA', opts).formatToParts(new Date(ms));
+  const out = {};
+  for (const p of parts) if (p.type !== 'literal') out[p.type] = p.value;
+  return out;
+}
+
+function localDate(ms, timeZone = requestedTimezone) {
+  const p = dateParts(ms, timeZone);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+// Validate timezone eagerly so a typo doesn't silently produce wrong billing/day grouping.
+try { dateParts(Date.now(), requestedTimezone); }
+catch (e) { console.error(`invalid timezone: ${requestedTimezone || '(local)'}: ${e.message}`); process.exit(2); }
+
+const today = localDate(Date.now());
+const targetDate = mode === 'today' ? today : requestedDate;
+if (mode === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+  console.error(`invalid date: ${targetDate}`);
+  process.exit(2);
+}
+
+function findSessionFiles(dir, out = []) {
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, ent.name);
+    if (ent.isDirectory()) findSessionFiles(p, out);
+    else if (ent.isFile() && (ent.name === 'session.jsonl' || ent.name === 'session.jsonl.zstd')) out.push(p);
+  }
+  return out;
+}
+
+function decodeZstdFramesNode(buf) {
+  if (typeof zlib.zstdDecompressSync !== 'function') throw new Error('node zstd unavailable');
+  const parts = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    const r = zlib.zstdDecompressSync(buf.subarray(offset), { info: true });
+    const consumed = r?.engine?.bytesWritten;
+    if (!Number.isSafeInteger(consumed) || consumed <= 0) throw new Error(`invalid zstd frame at offset ${offset}`);
+    parts.push(r.buffer);
+    offset += consumed;
+  }
+  return Buffer.concat(parts).toString('utf8');
+}
+
+function readLines(file) {
+  if (!file.endsWith('.zstd')) return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  const buf = fs.readFileSync(file);
+  try {
+    return decodeZstdFramesNode(buf).split('\n').filter(Boolean);
+  } catch (nodeErr) {
+    try {
+      const text = execFileSync('zstd', ['-dc', file], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
+      return text.split('\n').filter(Boolean);
+    } catch {
+      throw new Error(`${nodeErr.message}; install zstd CLI or use Node with zstd support`);
+    }
+  }
+}
+
+function n(v) { return Number.isFinite(Number(v)) ? Number(v) : 0; }
+function normalizeUsage(u) {
+  if (!u || typeof u !== 'object') return null;
+  return {
+    input: n(u.inputTokens ?? u.input_tokens),
+    cacheRead: n(u.cacheReadTokens ?? u.cache_read_tokens ?? u.cache_read_input_tokens),
+    cacheWrite: n(u.cacheWriteTokens ?? u.cacheCreationTokens ?? u.cache_write_tokens ?? u.cache_creation_input_tokens),
+    output: n(u.outputTokens ?? u.output_tokens),
+    reasoning: n(u.reasoningTokens ?? u.reasoning_tokens),
+  };
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: { 'user-agent': 'dshusage/0.2' }, signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function loadPricing() {
+  if (noCost) return { map: null, state: 'disabled', warning: null };
+
+  if (pricingOverrideFile) {
+    try { return { map: JSON.parse(fs.readFileSync(pricingOverrideFile, 'utf8')), state: 'file', warning: null }; }
+    catch (e) { return { map: null, state: 'unavailable', warning: `pricing file failed: ${e.message}` }; }
+  }
+
+  let cacheFresh = false;
+  try {
+    const st = fs.statSync(CACHE_FILE);
+    cacheFresh = Date.now() - st.mtimeMs < CACHE_MAX_AGE_MS;
+    if (cacheFresh && !refreshPricing) {
+      return { map: JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')), state: 'cache', warning: null };
+    }
+  } catch {}
+
+  try {
+    const map = await fetchJson(LITELLM_URL);
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(map));
+    return { map, state: 'fresh', warning: null };
+  } catch (e) {
+    try {
+      const map = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+      return { map, state: 'stale-cache', warning: `LiteLLM refresh failed; using stale cache (${e.message})` };
+    } catch {
+      return { map: null, state: 'unavailable', warning: `LiteLLM pricing unavailable (${e.message}); DeepSeek V4 override still works` };
+    }
+  }
+}
+
+
+async function loadUsdCnyRate() {
+  if (requestedCurrency === 'native') return { rate: null, state: 'native', warning: null };
+  if (requestedFxRate != null) return { rate: requestedFxRate, state: 'override', warning: null };
+
+  try {
+    const st = fs.statSync(FX_CACHE_FILE);
+    if (Date.now() - st.mtimeMs < CACHE_MAX_AGE_MS) {
+      const cached = JSON.parse(fs.readFileSync(FX_CACHE_FILE, 'utf8'));
+      if (Number.isFinite(Number(cached.rate)) && Number(cached.rate) > 0) {
+        return { rate: Number(cached.rate), state: 'cache', warning: null };
+      }
+    }
+  } catch {}
+
+  try {
+    const data = await fetchJson(FX_URL);
+    const rate = Number(data?.rates?.CNY);
+    if (!Number.isFinite(rate) || rate <= 0) throw new Error('missing CNY rate');
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(FX_CACHE_FILE, JSON.stringify({ rate, date: data.date || null, fetchedAt: new Date().toISOString() }));
+    return { rate, state: 'fresh', warning: null };
+  } catch (e) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(FX_CACHE_FILE, 'utf8'));
+      const rate = Number(cached.rate);
+      if (Number.isFinite(rate) && rate > 0) return { rate, state: 'stale-cache', warning: `FX refresh failed; using stale USD/CNY rate (${e.message})` };
+    } catch {}
+    return { rate: null, state: 'unavailable', warning: `USD/CNY rate unavailable (${e.message}); use --fx-rate RATE` };
+  }
+}
+
+function convertCosts(costs, targetCurrency, fx) {
+  if (targetCurrency === 'native') return { costs: { ...costs }, complete: true };
+  let total = 0;
+  for (const [currency, amount] of Object.entries(costs || {})) {
+    if (currency === targetCurrency) { total += amount; continue; }
+    if (currency === 'USD' && targetCurrency === 'CNY') {
+      if (!fx?.rate) return { costs: {}, complete: false };
+      total += amount * fx.rate;
+      continue;
+    }
+    if (currency === 'CNY' && targetCurrency === 'USD') {
+      if (!fx?.rate) return { costs: {}, complete: false };
+      total += amount / fx.rate;
+      continue;
+    }
+    return { costs: {}, complete: false };
+  }
+  return { costs: { [targetCurrency]: total }, complete: true };
+}
+
+function canonicalDeepSeekV4(model) {
+  const m = String(model || '').toLowerCase().match(/deepseek-v4-(flash|pro)(?:[-_.].*)?$/);
+  return m ? m[1] : null;
+}
+
+function deepSeekProviderKind(provider) {
+  const p = String(provider || '').toLowerCase();
+  if (p === 'tencent-tokenhub' || p.startsWith('tencent-tokenhub-')) return 'tencent-tokenhub';
+  if (p === 'deepseek-official' || p === 'deepseek') return 'deepseek-official';
+  return null;
+}
+
+function isDeepSeekPeak(ms) {
+  const p = dateParts(ms, DS_PEAK_TIMEZONE);
+  const minute = Number(p.hour) * 60 + Number(p.minute);
+  return (minute >= 9 * 60 && minute < 12 * 60) || (minute >= 14 * 60 && minute < 18 * 60);
+}
+
+function stripVersionSuffix(model) {
+  return String(model || '')
+    .replace(/[-_.](?:20\d{6}|20\d{4})$/i, '')
+    .replace(/[-_.](?:\d{8}|\d{6})$/i, '');
+}
+
+function providerAliases(provider) {
+  const p = String(provider || '').toLowerCase();
+  const a = [p];
+  if (p === 'tencent-tokenhub' || p.startsWith('tencent-tokenhub-')) a.push('tencent');
+  if (p === 'deepseek-official') a.push('deepseek');
+  return [...new Set(a.filter(Boolean))];
+}
+
+function pricingCandidates(provider, model) {
+  const models = [...new Set([String(model || ''), stripVersionSuffix(model)].filter(Boolean))];
+  const out = [];
+  for (const p of providerAliases(provider)) for (const m of models) out.push(`${p}/${m}`);
+  out.push(...models);
+  return [...new Set(out)];
+}
+
+function lookupLiteLLM(pricingMap, provider, model) {
+  if (!pricingMap) return null;
+  for (const key of pricingCandidates(provider, model)) {
+    const row = pricingMap[key];
+    if (!row || typeof row !== 'object') continue;
+    const input = n(row.input_cost_per_token);
+    const output = n(row.output_cost_per_token);
+    const cacheRead = n(row.cache_read_input_token_cost ?? row.input_cost_per_token_cache_hit);
+    const cacheWrite = n(row.cache_creation_input_token_cost);
+    const hasPriceField = ['input_cost_per_token','output_cost_per_token','cache_read_input_token_cost','input_cost_per_token_cache_hit','cache_creation_input_token_cost'].some(k => Object.prototype.hasOwnProperty.call(row, k));
+    if (hasPriceField) return { key, input, output, cacheRead, cacheWrite };
+  }
+  return null;
+}
+
+function resolvePrice(pricingMap, sample) {
+  const ds = canonicalDeepSeekV4(sample.model);
+  const providerKind = deepSeekProviderKind(sample.provider);
+  const billingTime = Number.isFinite(sample.pricingTime) ? sample.pricingTime : sample.time;
+
+  if (ds && providerKind && billingTime >= DS_DYNAMIC_EFFECTIVE_MS) {
+    const peak = isDeepSeekPeak(billingTime);
+    const mult = peak ? 2 : 1;
+    const base = providerKind === 'tencent-tokenhub'
+      ? TENCENT_TOKENHUB_OFFPEAK_CNY[ds]
+      : DEEPSEEK_OFFICIAL_OFFPEAK_USD[ds];
+    return {
+      input: base.input * mult,
+      cacheRead: base.cacheRead * mult,
+      cacheWrite: base.cacheWrite * mult,
+      output: base.output * mult,
+      source: `${providerKind}-${peak ? 'peak' : 'offpeak'}`,
+      band: peak ? 'peak' : 'offpeak',
+      currency: providerKind === 'tencent-tokenhub' ? 'CNY' : 'USD',
+      key: `${sample.provider}/${sample.model}`,
+    };
+  }
+
+  const row = lookupLiteLLM(pricingMap, sample.provider, sample.model);
+  if (!row) return null;
+  return { ...row, source: 'litellm', band: null, currency: 'USD' };
+}
+
+function sampleCost(sample, price) {
+  if (!price) return null;
+  return sample.input * price.input
+    + sample.cacheRead * price.cacheRead
+    + sample.cacheWrite * price.cacheWrite
+    + sample.output * price.output;
+}
+
+(async function main() {
+  const pricing = await loadPricing();
+  const samples = new Map();
+  let filesRead = 0;
+  let filesSkipped = 0;
+
+  for (const file of findSessionFiles(root)) {
+    let rows;
+    try { rows = readLines(file).map(JSON.parse); }
+    catch (e) { filesSkipped++; if (!jsonOutput) console.error(`warning: skip ${file}: ${e.message}`); continue; }
+    if (!rows.length) continue;
+    filesRead++;
+
+    const header = rows[0]?.type === 'session' ? rows[0] : null;
+    const sessionId = header?.id || file;
+    const seedLength = Number.isSafeInteger(header?.seedLength) ? header.seedLength : 0;
+    let currentStep = null;
+    const routes = new Map();
+
+    for (let i = 1; i < rows.length; i++) {
+      const e = rows[i];
+      if (!e || typeof e !== 'object') continue;
+      if (Number.isSafeInteger(e.seq) && e.seq < seedLength) continue;
+
+      if (e.type === 'step/start') {
+        currentStep = `${e.data?.turn}:${e.data?.step}`;
+        continue;
+      }
+      if (e.type === 'step/end') {
+        currentStep = null;
+        continue;
+      }
+      if (e.type === 'request/header' && currentStep) {
+        const c = e.data?.header?.config;
+        if (c?.model) routes.set(currentStep, { provider: c.provider || '?', model: c.model, requestTime: normalizeTimestamp(e.time) });
+        continue;
+      }
+
+      if (e.type === 'assistant/chunk' && e.data?.chunk?.type === 'usage') {
+        const u = normalizeUsage(e.data.chunk.usage);
+        const time = normalizeTimestamp(e.time);
+        if (!u || !Number.isFinite(time)) continue;
+        const step = `${e.data.turn}:${e.data.step}`;
+        const route = routes.get(step) || { provider: '?', model: '?' };
+        samples.set(`${sessionId}|step|${step}`, { time, pricingTime: route.requestTime, provider: route.provider, model: route.model, ...u, kind: 'step' });
+        continue;
+      }
+
+      if (e.type === 'assistant/message' && e.data?.usage) {
+        const u = normalizeUsage(e.data.usage);
+        const time = normalizeTimestamp(e.time);
+        if (!u || !Number.isFinite(time)) continue;
+        const step = `${e.data.turn}:${e.data.step}`;
+        const src = e.data.message?.source;
+        const routed = routes.get(step);
+        const route = src?.kind === 'model'
+          ? { provider: src.provider || '?', model: src.model || '?', requestTime: routed?.requestTime }
+          : (routed || { provider: '?', model: '?' });
+        samples.set(`${sessionId}|step|${step}`, { time, pricingTime: route.requestTime, provider: route.provider, model: route.model, ...u, kind: 'step' });
+        continue;
+      }
+
+      if (e.type === 'compaction/summary' && e.data?.usage) {
+        const u = normalizeUsage(e.data.usage);
+        const time = normalizeTimestamp(e.time);
+        if (!u || !Number.isFinite(time)) continue;
+        const id = e.data.compactionId ?? e.seq ?? i;
+        samples.set(`${sessionId}|compact|${id}`, {
+          time, provider: e.data.provider || '?', model: e.data.model || '?', ...u, kind: 'compact'
+        });
+      }
+    }
+  }
+
+  const agg = new Map();
+  for (const s of samples.values()) {
+    if (mode !== 'all' && localDate(s.time) !== targetDate) continue;
+
+    // DSH may persist placeholder/finalization usage records with no route and
+    // every token bucket equal to zero. They are not billable model calls and
+    // must not affect CALLS, unknown-price warnings, or totals.
+    const billableTokens = s.input + s.cacheRead + s.cacheWrite + s.output;
+    if (billableTokens === 0) continue;
+
+    const price = noCost ? null : resolvePrice(pricing.map, s);
+    const cost = noCost ? null : sampleCost(s, price);
+    const normalizedModel = normalizeModels ? stripVersionSuffix(s.model) : s.model;
+    const key = normalizeModels ? normalizedModel : `${s.provider}\u0000${s.model}`;
+    const a = agg.get(key) || {
+      provider: normalizeModels ? null : s.provider, model: normalizedModel,
+      input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0,
+      calls: 0, compactions: 0, pricedCalls: 0, unpricedCalls: 0,
+      costs: {}, priceSources: new Set(), priceKeys: new Set(),
+      bands: { peak: null, offpeak: null },
+    };
+    a.input += s.input;
+    a.cacheRead += s.cacheRead;
+    a.cacheWrite += s.cacheWrite;
+    a.output += s.output;
+    a.reasoning += s.reasoning;
+    a.calls++;
+    if (s.kind === 'compact') a.compactions++;
+    if (!noCost) {
+      if (cost == null) a.unpricedCalls++;
+      else {
+        const currency = price.currency || 'USD';
+        a.costs[currency] = (a.costs[currency] || 0) + cost;
+        a.pricedCalls++;
+      }
+    }
+    if (price?.source) a.priceSources.add(price.source);
+    if (price?.key) a.priceKeys.add(price.key);
+    if (price?.band === 'peak' || price?.band === 'offpeak') {
+      const band = price.band;
+      const b = a.bands[band] || { input:0, cacheRead:0, cacheWrite:0, output:0, calls:0, costs:{} };
+      b.input += s.input; b.cacheRead += s.cacheRead; b.cacheWrite += s.cacheWrite; b.output += s.output; b.calls++;
+      if (cost != null) {
+        const currency = price.currency || 'USD';
+        b.costs[currency] = (b.costs[currency] || 0) + cost;
+      }
+      a.bands[band] = b;
+    }
+    agg.set(key, a);
+  }
+
+  const rows = [...agg.values()].sort((a, b) =>
+    (b.input + b.cacheRead + b.cacheWrite + b.output) - (a.input + a.cacheRead + a.cacheWrite + a.output)
+  );
+
+  function priceLabel(r) {
+    if (noCost) return T.disabled;
+    const s = r.priceSources;
+    if (!s.size) return T.unknown;
+    const hasPeak = [...s].some(x => x.endsWith('-peak'));
+    const hasOffpeak = [...s].some(x => x.endsWith('-offpeak'));
+    const isDeepSeek = [...s].some(x => x.startsWith('tencent-tokenhub-') || x.startsWith('deepseek-official-'));
+    if (isDeepSeek && hasPeak && hasOffpeak) {
+      return language === 'zh' && funny ? '梁文峰+梁文谷' : `DeepSeek ${T.mixed}`;
+    }
+    if (isDeepSeek && hasPeak) {
+      return language === 'zh' && funny ? '梁文峰' : `DeepSeek ${bandLabel('peak')}`;
+    }
+    if (isDeepSeek && hasOffpeak) {
+      return language === 'zh' && funny ? '梁文谷' : `DeepSeek ${bandLabel('offpeak')}`;
+    }
+    if (s.size === 1 && s.has('litellm')) return 'LiteLLM';
+    return [...s].join('+');
+  }
+
+
+  const totals = rows.reduce((a, r) => {
+    a.input += r.input; a.cacheRead += r.cacheRead; a.cacheWrite += r.cacheWrite; a.output += r.output;
+    a.calls += r.calls; a.pricedCalls += r.pricedCalls; a.unpricedCalls += r.unpricedCalls;
+    for (const [currency, amount] of Object.entries(r.costs)) a.costs[currency] = (a.costs[currency] || 0) + amount;
+    return a;
+  }, { input:0, cacheRead:0, cacheWrite:0, output:0, calls:0, pricedCalls:0, unpricedCalls:0, costs:{} });
+
+
+  const nativeCurrencies = Object.keys(totals.costs);
+  const needsFx = !noCost && requestedCurrency !== 'native' && nativeCurrencies.some(c => c !== requestedCurrency);
+  const fx = noCost ? { rate: null, state: 'disabled', warning: null }
+    : (needsFx ? await loadUsdCnyRate() : { rate: requestedFxRate, state: 'not-needed', warning: null });
+  const label = mode === 'all' ? T.allTime : targetDate;
+  function outputCosts(costs) { return convertCosts(costs, requestedCurrency, fx); }
+
+  if (jsonOutput) {
+    function rowCostNumber(r) {
+      if (noCost || r.pricedCalls === 0) return 0;
+      const c = outputCosts(r.costs);
+      if (!c.complete) return null;
+      const vals = Object.values(c.costs || {});
+      return vals.length === 1 ? vals[0] : null;
+    }
+    const modelBreakdowns = rows.map(r => ({
+      modelName: r.model,
+      ...(normalizeModels ? {} : { provider: r.provider }),
+      inputTokens: r.input,
+      outputTokens: r.output,
+      cacheCreationTokens: r.cacheWrite,
+      cacheReadTokens: r.cacheRead,
+      totalTokens: r.input + r.cacheRead + r.cacheWrite + r.output,
+      cost: rowCostNumber(r),
+      calls: r.calls,
+      ...(peakBreakdown ? {
+        peakBreakdown: Object.fromEntries(Object.entries(r.bands).filter(([,b]) => b).map(([band,b]) => [band, {
+          inputTokens: b.input,
+          outputTokens: b.output,
+          cacheCreationTokens: b.cacheWrite,
+          cacheReadTokens: b.cacheRead,
+          totalTokens: b.input + b.cacheRead + b.cacheWrite + b.output,
+          calls: b.calls,
+          cost: (() => {
+            if (noCost) return 0;
+            const c = outputCosts(b.costs);
+            if (!c.complete) return null;
+            const vals = Object.values(c.costs || {});
+            return vals.length === 1 ? vals[0] : null;
+          })(),
+        }]))
+      } : {}),
+    }));
+    const totalCostConverted = noCost || totals.pricedCalls === 0 ? 0 : (() => {
+      const c = outputCosts(totals.costs);
+      if (!c.complete) return null;
+      const vals = Object.values(c.costs || {});
+      return vals.length === 1 ? vals[0] : null;
+    })();
+    const day = {
+      date: mode === 'all' ? 'all' : targetDate,
+      inputTokens: totals.input,
+      outputTokens: totals.output,
+      cacheCreationTokens: totals.cacheWrite,
+      cacheReadTokens: totals.cacheRead,
+      totalTokens: totals.input + totals.cacheRead + totals.cacheWrite + totals.output,
+      totalCost: totalCostConverted,
+      modelsUsed: rows.map(r => r.model),
+      modelBreakdowns,
+      calls: totals.calls,
+    };
+    const payload = {
+      daily: [day],
+      totals: {
+        inputTokens: totals.input,
+        outputTokens: totals.output,
+        cacheCreationTokens: totals.cacheWrite,
+        cacheReadTokens: totals.cacheRead,
+        totalTokens: totals.input + totals.cacheRead + totals.cacheWrite + totals.output,
+        totalCost: totalCostConverted,
+        calls: totals.calls,
+      },
+      meta: {
+        timezone: requestedTimezone || 'local',
+        currency: requestedCurrency,
+        normalized: normalizeModels,
+        fxRate: fx.rate,
+        pricedCalls: totals.pricedCalls,
+        unpricedCalls: totals.unpricedCalls,
+        filesRead,
+        filesSkipped,
+      },
+    };
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+
+  const colorEnabled = !jsonOutput && colorMode !== 'never' && (
+    colorMode === 'always' ||
+    (colorMode === 'auto' && process.stdout.isTTY && process.env.TERM !== 'dumb' && !('NO_COLOR' in process.env)) ||
+    (colorMode === 'auto' && process.env.FORCE_COLOR && process.env.FORCE_COLOR !== '0')
+  );
+  const ANSI = {
+    reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
+    red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', blue: '\x1b[34m',
+    magenta: '\x1b[35m', cyan: '\x1b[36m', gray: '\x1b[90m',
+  };
+  function paint(text, ...styles) {
+    if (!colorEnabled || !styles.length) return String(text);
+    return styles.map(s => ANSI[s] || '').join('') + text + ANSI.reset;
+  }
+
+  const tryCommand = 'curl -fsSL https://raw.githubusercontent.com/BeforeWave/dshusage/main/dshusage | sh';
+  function printTryCommand() {
+    console.log('');
+    console.log(paint(language === 'zh' ? `试试看你的：${tryCommand}` : `Try yours: ${tryCommand}`, 'dim'));
+  }
+
+  console.log(paint(`${T.title} — ${label}`, 'bold', 'cyan'));
+  if (!rows.length) {
+    console.log(T.noUsage);
+    printTryCommand();
+    return;
+  }
+
+  function fmt(x) { return Math.round(x).toLocaleString('en-US'); }
+  function formatCosts(costs, suffix = '') {
+    const converted = outputCosts(costs);
+    if (!converted.complete) return '?';
+    const shown = converted.costs;
+    const parts = [];
+    for (const currency of ['CNY','USD', ...Object.keys(shown).filter(c => c !== 'CNY' && c !== 'USD').sort()]) {
+      const v = shown[currency];
+      if (v == null) continue;
+      const num = v.toFixed(v < 1 ? 4 : 2);
+      parts.push(currency === 'CNY' ? `¥${num}` : currency === 'USD' ? `$${num}` : `${currency} ${num}`);
+    }
+    return parts.length ? parts.join(' + ') + suffix : '?';
+  }
+  function money(r) {
+    if (noCost) return '-';
+    if (r.pricedCalls === 0) return '?';
+    return formatCosts(r.costs, r.unpricedCalls ? '+' : '');
+  }
+  function charWidth(cp) {
+    if (cp === 0) return 0;
+    if (cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+    return (cp >= 0x1100 && (cp <= 0x115f || cp === 0x2329 || cp === 0x232a ||
+      (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) || (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe10 && cp <= 0xfe19) ||
+      (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff))) ? 2 : 1;
+  }
+  function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ''); }
+  function displayWidth(s) { let w = 0; for (const ch of stripAnsi(s)) w += charWidth(ch.codePointAt(0)); return w; }
+  function pad(s, width, left = false) { s = String(s); const spaces = Math.max(0, width - displayWidth(s)); return left ? ' '.repeat(spaces) + s : s + ' '.repeat(spaces); }
+
+  const display = rows.map(r => ({
+    model: normalizeModels || !r.provider || r.provider === '?' ? r.model : `${r.model} (${r.provider})`,
+    input: fmt(r.input), hit: fmt(r.cacheRead), write: fmt(r.cacheWrite), output: fmt(r.output),
+    total: fmt(r.input + r.cacheRead + r.cacheWrite + r.output), calls: fmt(r.calls),
+    cost: money(r), price: priceLabel(r),
+  }));
+  const widths = {
+    model: Math.max(displayWidth(T.model), ...display.map(r => displayWidth(r.model))),
+    input: Math.max(displayWidth(T.input), ...display.map(r => displayWidth(r.input))),
+    hit: Math.max(displayWidth(T.cacheHit), ...display.map(r => displayWidth(r.hit))),
+    write: Math.max(displayWidth(T.cacheWrite), ...display.map(r => displayWidth(r.write))),
+    output: Math.max(displayWidth(T.output), ...display.map(r => displayWidth(r.output))),
+    total: Math.max(displayWidth(T.total), ...display.map(r => displayWidth(r.total))),
+    calls: Math.max(displayWidth(T.calls), ...display.map(r => displayWidth(r.calls))),
+    cost: Math.max(displayWidth(T.cost), ...display.map(r => displayWidth(r.cost))),
+    price: Math.max(displayWidth(T.price), ...display.map(r => displayWidth(r.price))),
+  };
+  const lineLen = Object.values(widths).reduce((a,b)=>a+b,0) + 16;
+
+  function styledCell(text, width, left, ...styles) {
+    return paint(pad(text, width, left), ...styles);
+  }
+  function costStyle(cost) {
+    if (cost === '?' || cost === '-') return ['dim'];
+    return ['bold', 'yellow'];
+  }
+  function priceStyles(price) {
+    if (language === 'zh' && funny && price.includes('梁文峰') && price.includes('梁文谷')) return ['bold', 'magenta'];
+    if (price.includes(bandLabel('peak'))) return ['bold', 'red'];
+    if (price.includes(bandLabel('offpeak'))) return ['green'];
+    if (price === 'LiteLLM') return ['cyan'];
+    if (price === T.unknown) return ['red'];
+    return ['dim'];
+  }
+
+  const header = [
+    styledCell(T.model, widths.model, false, 'bold', 'cyan'),
+    styledCell(T.input, widths.input, true, 'bold', 'blue'),
+    styledCell(T.cacheHit, widths.hit, true, 'bold', 'green'),
+    styledCell(T.cacheWrite, widths.write, true, 'bold', 'yellow'),
+    styledCell(T.output, widths.output, true, 'bold', 'magenta'),
+    styledCell(T.total, widths.total, true, 'bold', 'cyan'),
+    styledCell(T.calls, widths.calls, true, 'bold'),
+    styledCell(T.cost, widths.cost, true, 'bold', 'yellow'),
+    styledCell(T.price, widths.price, false, 'bold'),
+  ].join('  ');
+  console.log(header);
+  console.log(paint('-'.repeat(lineLen), 'dim'));
+  for (let i = 0; i < display.length; i++) {
+    const r = display[i];
+    const raw = rows[i];
+    console.log([
+      styledCell(r.model, widths.model, false, 'cyan'),
+      styledCell(r.input, widths.input, true, 'blue'),
+      styledCell(r.hit, widths.hit, true, 'green'),
+      styledCell(r.write, widths.write, true, 'yellow'),
+      styledCell(r.output, widths.output, true, 'magenta'),
+      styledCell(r.total, widths.total, true, 'bold'),
+      styledCell(r.calls, widths.calls, true, 'dim'),
+      styledCell(r.cost, widths.cost, true, ...costStyle(r.cost)),
+      styledCell(r.price, widths.price, false, ...priceStyles(r.price)),
+    ].join('  '));
+    if (peakBreakdown) {
+      for (const band of ['peak','offpeak']) {
+        const b = raw.bands[band];
+        if (!b) continue;
+        const label = `  ↳ ${bandLabel(band)}`;
+        const bCost = noCost ? '-' : formatCosts(b.costs);
+        const bandStyles = band === 'peak' ? ['bold', 'red'] : ['green'];
+        console.log([
+          styledCell(label, widths.model, false, ...bandStyles),
+          styledCell(fmt(b.input), widths.input, true, ...bandStyles),
+          styledCell(fmt(b.cacheRead), widths.hit, true, ...bandStyles),
+          styledCell(fmt(b.cacheWrite), widths.write, true, ...bandStyles),
+          styledCell(fmt(b.output), widths.output, true, ...bandStyles),
+          styledCell(fmt(b.input+b.cacheRead+b.cacheWrite+b.output), widths.total, true, ...bandStyles),
+          styledCell(fmt(b.calls), widths.calls, true, ...bandStyles),
+          styledCell(bCost, widths.cost, true, ...bandStyles),
+          pad('', widths.price),
+        ].join('  '));
+      }
+    }
+  }
+  console.log(paint('-'.repeat(lineLen), 'dim'));
+  const totalCost = noCost ? '-' : (totals.pricedCalls === 0 ? '?' : formatCosts(totals.costs, totals.unpricedCalls ? '+' : ''));
+  console.log([
+    styledCell(T.totalRow, widths.model, false, 'bold', 'cyan'),
+    styledCell(fmt(totals.input), widths.input, true, 'bold', 'blue'),
+    styledCell(fmt(totals.cacheRead), widths.hit, true, 'bold', 'green'),
+    styledCell(fmt(totals.cacheWrite), widths.write, true, 'bold', 'yellow'),
+    styledCell(fmt(totals.output), widths.output, true, 'bold', 'magenta'),
+    styledCell(fmt(totals.input+totals.cacheRead+totals.cacheWrite+totals.output), widths.total, true, 'bold', 'cyan'),
+    styledCell(fmt(totals.calls), widths.calls, true, 'bold'),
+    styledCell(totalCost, widths.cost, true, 'bold', 'yellow'),
+    pad('', widths.price),
+  ].join('  '));
+
+  if (pricing.warning) console.error(`${language === 'zh' ? '警告' : 'warning'}: ${pricing.warning}`);
+  if (fx.warning) console.error(`${language === 'zh' ? '警告' : 'warning'}: ${fx.warning}`);
+  if (!noCost && requestedCurrency !== 'native' && !fx.rate && Object.keys(totals.costs).some(c => c !== requestedCurrency)) console.error(`${language === 'zh' ? '警告: 无法统一换算货币，请使用 --fx-rate RATE' : 'warning: cannot normalize currencies; use --fx-rate RATE'}`);
+  if (!noCost && totals.unpricedCalls) console.error(language === 'zh' ? `警告: ${totals.unpricedCalls} 次调用未匹配价格；费用后的 + 表示部分计费` : `warning: ${totals.unpricedCalls} call(s) have no matched price; COST marked with + is a partial total`);
+  if (filesSkipped) console.error(language === 'zh' ? `警告: 跳过 ${filesSkipped} 个 session 文件` : `warning: ${filesSkipped} session file(s) skipped`);
+
+  printTryCommand();
+})().catch(e => {
+  console.error(`dshusage: ${e.stack || e.message || e}`);
+  process.exit(1);
+});
+NODE
